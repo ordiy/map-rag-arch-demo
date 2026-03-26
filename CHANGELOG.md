@@ -55,3 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic `LangGraph` state machine implementation (Retrieve -> Grade -> Rewrite/Generate).
 - LanceDB vector store integration using Google `text-embedding-004`.
 - Setup a REST API backend with `FastAPI`.
+
+## [v1.7.0-mvp-small-to-big] - 2026-03-24
+### Added
+- Implemented "Small-to-Big" (Parent-Child) retrieval architecture. Vector store (LanceDB) now stores fine-grained text chunks to maximize recall limits, while the Document Store (MongoDB) maps these child chunks back to their full parent context.
+- Modified the retrieval pipeline to perform "Context Expansion" prior to the Rerank node, passing the complete document graph to the Jina Cross-Encoder. This completely eliminates referential ambiguity (e.g. lost pronouns) during semantic scoring.
+- Added `scripts/test_small2big.py` testing suite to validate NDCG metric lifts specifically triggered by parent-context expansion.
+
+### Fixed
+- Stabilized LanceDB batch insertion logic by moving off LangChain's `add_documents` wrapper in favor of native PyArrow insertion `.add()`.

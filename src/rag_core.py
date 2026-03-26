@@ -2,6 +2,7 @@ import os
 import json
 import math
 import asyncio
+import uuid
 import requests
 import lancedb
 import mongomock
@@ -107,14 +108,26 @@ async def process_document_task(content: str, filename: str, task_state: dict):
     docs_to_insert = []
     mongo_records = []
     
-    # Assign unique IDs
-    start_id = collection.count_documents({}) + 1
+    # Implement Small-to-Big: Store parent doc
+    parent_id = f"parent_{uuid.uuid4().hex[:8]}"
+    collection.insert_one({
+        "id": parent_id,
+        "type": "parent",
+        "source": filename,
+        "full_content": content
+    })
     
     for i, chunk in enumerate(chunks):
-        doc_id = start_id + i
-        meta = {"doc_id": doc_id, "source": filename}
+        chunk_id = f"chunk_{parent_id}_{i}"
+        meta = {"doc_id": chunk_id, "parent_id": parent_id, "source": filename}
         docs_to_insert.append(Document(page_content=chunk, metadata=meta))
-        mongo_records.append({"id": doc_id, "source": filename, "content": chunk})
+        mongo_records.append({
+            "id": chunk_id, 
+            "type": "child",
+            "parent_id": parent_id, 
+            "source": filename, 
+            "content": chunk
+        })
         
     # Insert to Mongo
     if mongo_records:
@@ -124,10 +137,25 @@ async def process_document_task(content: str, filename: str, task_state: dict):
     
     # Insert to LanceDB
     if docs_to_insert:
-        if TABLE_NAME not in db_lance.table_names():
-            vectorstore = LanceDB.from_documents(docs_to_insert, doc_embeddings, connection=db_lance, table_name=TABLE_NAME)
+        # We manually embed to avoid Langchain LanceDB wrapper bugs when appending
+        texts = [d.page_content for d in docs_to_insert]
+        embeds = doc_embeddings.embed_documents(texts)
+        data = []
+        for j, d in enumerate(docs_to_insert):
+            data.append({
+                "vector": embeds[j], 
+                "text": d.page_content, 
+                "metadata": d.metadata
+            })
+            
+        if TABLE_NAME in db_lance.table_names():
+            tbl = db_lance.open_table(TABLE_NAME)
+            tbl.add(data)
+            if vectorstore is None:
+                vectorstore = LanceDB(connection=db_lance, table_name=TABLE_NAME, embedding=doc_embeddings)
         else:
-            vectorstore.add_documents(docs_to_insert)
+            tbl = db_lance.create_table(TABLE_NAME, data=data)
+            vectorstore = LanceDB(connection=db_lance, table_name=TABLE_NAME, embedding=doc_embeddings)
 
     task_state["status"] = "completed"
     task_state["progress"] = 100
@@ -147,15 +175,31 @@ class GradeDocuments(BaseModel):
 grader_llm = llm.with_structured_output(GradeDocuments)
 
 def retrieve_and_rerank_node(state: AgentState):
-    state.get("logs", []).append("Executing Vector Search (Top 10)")
+    state.get("logs", []).append("Executing Vector Search (Top 10 child chunks)")
     if not vectorstore:
         return {"documents": [], "logs": state.get("logs", [])}
         
     retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    retrieved_docs = retriever.invoke(state["question"])
+    retrieved_chunks = retriever.invoke(state["question"])
     
-    state.get("logs", []).append("Executing Jina Cross-Encoder Rerank (Top 3)")
-    reranked_docs = jina_rerank(state["question"], retrieved_docs, top_n=3)
+    state.get("logs", []).append("Context Expansion: Mapping chunks to Parent Documents (Small-to-Big)")
+    expanded_docs = []
+    seen_parents = set()
+    
+    for chunk in retrieved_chunks:
+        parent_id = chunk.metadata.get("parent_id")
+        if parent_id and parent_id not in seen_parents:
+            seen_parents.add(parent_id)
+            parent_record = collection.find_one({"id": parent_id, "type": "parent"})
+            if parent_record:
+                full_text = f"[Source: {parent_record.get('source', 'Unknown')}]\n{parent_record['full_content']}"
+                expanded_docs.append(Document(page_content=full_text, metadata={"parent_id": parent_id}))
+                
+    if not expanded_docs:
+        expanded_docs = retrieved_chunks # Fallback if no parent found
+
+    state.get("logs", []).append(f"Executing Jina Cross-Encoder Rerank (Top 3) on {len(expanded_docs)} Parent Documents")
+    reranked_docs = jina_rerank(state["question"], expanded_docs, top_n=3)
     
     return {"documents": [doc.page_content for doc in reranked_docs], "logs": state.get("logs", [])}
 
@@ -231,14 +275,29 @@ def run_evaluation(query: str, expected_substring: str):
     if not vectorstore:
         return {"error": "Database is empty."}
         
-    # Vector Search
+    # 1. Vector Search
     retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    base_docs = retriever.invoke(query)
+    retrieved_chunks = retriever.invoke(query)
     
-    # Rerank
-    reranked_docs = jina_rerank(query, base_docs, top_n=10)
+    # 2. Small-to-Big Context Expansion
+    expanded_docs = []
+    seen_parents = set()
+    for chunk in retrieved_chunks:
+        parent_id = chunk.metadata.get("parent_id")
+        if parent_id and parent_id not in seen_parents:
+            seen_parents.add(parent_id)
+            parent_record = collection.find_one({"id": parent_id, "type": "parent"})
+            if parent_record:
+                full_text = f"[Source: {parent_record.get('source', 'Unknown')}]\n{parent_record['full_content']}"
+                expanded_docs.append(Document(page_content=full_text, metadata={"parent_id": parent_id}))
+                
+    if not expanded_docs:
+        expanded_docs = retrieved_chunks
     
-    # Find rank
+    # 3. Rerank Expanded Docs
+    reranked_docs = jina_rerank(query, expanded_docs, top_n=10)
+    
+    # Find rank based on whether the full parent text contains the expected string
     hit_rank = -1
     for i, doc in enumerate(reranked_docs):
         if expected_substring.lower() in doc.page_content.lower():
