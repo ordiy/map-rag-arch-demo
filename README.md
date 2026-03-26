@@ -1,4 +1,4 @@
-# MAP-RAG Architecture MVP
+# 🧠 DynaSense-RAG (MAP-RAG Architecture)
 
 > **MAP-RAG**: Multi-resolution Agentic Perception Retrieval-Augmented Generation
 
