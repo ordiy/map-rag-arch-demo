@@ -29,7 +29,7 @@ TABLE_NAME = "knowledge_base"
 os.makedirs(os.path.dirname(LANCEDB_URI), exist_ok=True)
 doc_embeddings = VertexAIEmbeddings(model_name="text-embedding-004")
 query_embeddings = VertexAIEmbeddings(model_name="text-embedding-004")
-llm = ChatVertexAI(model_name="gemini-1.5-flash", temperature=0)
+llm = ChatVertexAI(model_name="gemini-2.5-flash", temperature=0)
 
 # MongoDB Mock setup
 mongo_client = mongomock.MongoClient()
