@@ -16,36 +16,55 @@ Instead, this architecture achieves high precision through:
 4. **Strict Grader Node** (LangGraph state machine for hallucination prevention)
 
 
+
 ## 🏗️ Architecture Design (MAP-RAG)
 
-```mermaid
-graph TD
-    subaxis
-    subgraph Data Ingestion Pipeline
-        A[Raw Documents: TXT/MD] -->|Async Upload| B(Jina Semantic Segmenter)
-        B -->|Chunking| C[Raw Chunks]
-        C -->|Primary Key| D[(Document DB / MongoDB)]
-        C -->|Vertex text-embedding-004| E[Dense Vectors]
-        E -->|doc_id metadata| F[(Vector DB / LanceDB)]
-    end
+```text
+[ Data Ingestion Pipeline ]
 
-    subgraph User Retrieval & Generation (LangGraph)
-        U[User Query] --> G[Vector Search K=10]
-        F -.->|Retrieve| G
-        G --> H[Cross-Encoder Reranker K=3]
-        H -.->|Jina Multilingual API| H
-        H -->|Fetch full text by doc_id| D
-        H --> I{Grader Node: Anti-Hallucination}
-        
-        I -->|Strict 'YES'| J[Synthesize Answer: gemini-1.5-flash]
-        I -->|Strict 'NO'| K[Reject / Fallback Message]
-        
-        J --> L[Final Response + Logs]
-        K --> L
-    end
+Raw Documents (TXT/MD)
+      │
+      ▼
+[ Jina Semantic Segmenter ] ──(Chunking)──> Raw Text Chunks
+                                              │
+                    ┌─────────────────────────┴─────────────────────────┐
+                    ▼                                                   ▼
+            [ Document DB ]                                 [ Vertex Embeddings ]
+            (e.g., MongoDB)                                    (text-embedding)
+            Stores: full text                                           │
+            key: doc_id                                                 ▼
+                                                              [ Vector DB (LanceDB) ]
+                                                              Stores: dense vector
+                                                              Metadata: doc_id
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+[ Retrieval & Generation Pipeline ]
+
+ User Query
+      │
+      ▼
+[ LanceDB Vector Search ] ──(Top K=10)──> Initial Candidate docs (doc_ids)
+      │
+      ▼
+[ Jina Cross-Encoder Reranker ] ──(Top K=3)──> High-Precision docs
+      │
+      ▼
+[ Fetch Full Text ] <──(By doc_id from Document DB)
+      │
+      ▼
+[ LangGraph Grader Node ] ──(Anti-Hallucination check)
+      │
+      ├─────(If STRICT 'NO')─────> [ Reject / Fallback Message ]
+      │
+      └─────(If STRICT 'YES')────> [ Gemini Generator Node ] 
+                                           │
+                                           ▼
+                                 Final Synthesized Answer
 ```
 
 The system uses a strict directed graph (State Machine) to process user queries. By explicitly dropping the *Query Rewrite* node from the main critical path, we eliminate Intent Drift and drastically reduce API latency.
+
 
 
 ## 📊 Benchmark Results (SciQ Dataset)
